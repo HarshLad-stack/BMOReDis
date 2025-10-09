@@ -8,6 +8,7 @@ public class RedisServer {
 
     private static ConcurrentHashMap<String, String> database = new ConcurrentHashMap<>();
     private static ConcurrentHashMap<String, Long> expirations = new ConcurrentHashMap<>();
+    private static AOFWriter aofWriter;
 
     private static void handleClient(Socket clientSocket) throws IOException {
         InputStream in = clientSocket.getInputStream();
@@ -30,7 +31,6 @@ public class RedisServer {
                 String result = processCommandRESP(commandParts);
                 System.out.println("Received: " + Arrays.toString(commandParts));
 
-
                 // Write result back in RESP format
                 RESPWriter.writeSimpleString(out, result);
 
@@ -47,7 +47,6 @@ public class RedisServer {
 
         switch (command) {
             case "SET":
-
                 return handleSET(parts);
             case "GET":
                 return handleGET(parts);
@@ -79,6 +78,7 @@ public class RedisServer {
     private static String handleSET(String[] parts) {
         if (parts.length < 3) return "ERROR: SET requires key and value";
         database.put(parts[1], parts[2]);
+        aofWriter.log("SET " + parts[1] + " " + parts[2]);
         return "OK";
     }
 
@@ -89,7 +89,13 @@ public class RedisServer {
 
     private static String handleDEL(String[] parts) {
         if (parts.length < 2) return "ERROR: DEL requires key";
-        return database.remove(parts[1]) != null ? "1" : "0";
+        String removed = database.remove(parts[1]);
+        if (removed != null) {
+            expirations.remove(parts[1]); // Also remove TTL
+            aofWriter.log("DEL " + parts[1]);
+            return "1";
+        }
+        return "0";
     }
 
     private static String handleEXISTS(String[] parts) {
@@ -123,6 +129,7 @@ public class RedisServer {
         }
 
         current += increment;
+        aofWriter.log("INCRBY " + key + " " + increment);
         database.put(key, String.valueOf(current));
         return String.valueOf(current);
     }
@@ -148,6 +155,7 @@ public class RedisServer {
         }
 
         current -= decrement;
+        aofWriter.log("DECRBY " + key + " " + decrement);
         database.put(key, String.valueOf(current));
         return String.valueOf(current);
     }
@@ -164,7 +172,9 @@ public class RedisServer {
             return "ERROR: seconds must be integer";
         }
 
-        expirations.put(key, System.currentTimeMillis() + seconds * 1000L);
+        long expireAt = System.currentTimeMillis() + seconds * 1000L;
+        expirations.put(key, expireAt);
+        aofWriter.log("EXPIRE " + key + " " + expireAt); // log absolute timestamp
         return "1";
     }
 
@@ -199,11 +209,80 @@ public class RedisServer {
         });
     }
 
+    private static void loadFromAOF(String filename) {
+        File file = new File(filename);
+        if (!file.exists()) {
+            System.out.println("No AOF file found, starting fresh");
+            return;
+        }
+        System.out.println("Loading data from " + filename + "...");
+        int commandsLoaded = 0;
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String[] parts = line.split(" ");
+                String command = parts[0].toUpperCase();
+
+                switch (command) {
+                    case "SET":
+                        if (parts.length >= 3) database.put(parts[1], parts[2]);
+                        break;
+                    case "DEL":
+                        database.remove(parts[1]);
+                        expirations.remove(parts[1]);
+                        break;
+                    case "EXPIRE":
+                        if (parts.length >= 3) expirations.put(parts[1], Long.parseLong(parts[2])); // absolute timestamp
+                        break;
+                    case "INCRBY":
+                        if (parts.length >= 3) {
+                            int current = database.containsKey(parts[1]) ? Integer.parseInt(database.get(parts[1])) : 0;
+                            current += Integer.parseInt(parts[2]);
+                            database.put(parts[1], String.valueOf(current));
+                        }
+                        break;
+                    case "DECRBY":
+                        if (parts.length >= 3) {
+                            int current = database.containsKey(parts[1]) ? Integer.parseInt(database.get(parts[1])) : 0;
+                            current -= Integer.parseInt(parts[2]);
+                            database.put(parts[1], String.valueOf(current));
+                        }
+                        break;
+                    // other commands ignored in AOF
+                }
+
+                commandsLoaded++;
+            }
+            System.out.println("Loaded " + commandsLoaded + " commands from AOF");
+            System.out.println("Database has " + database.size() + " keys");
+
+        } catch (IOException e) {
+            System.err.println("Error loading AOF file: " + e.getMessage());
+        }
+    }
+
     public static void main(String[] args) throws IOException {
+        // Thread pool for clients
         ExecutorService threadPool = Executors.newFixedThreadPool(10);
+        // Scheduler for cleaning expired keys
         ScheduledExecutorService cleanupScheduler = Executors.newScheduledThreadPool(1);
         cleanupScheduler.scheduleAtFixedRate(RedisServer::cleanUpExpiredKeys, 1, 1, TimeUnit.SECONDS);
 
+        // Initialize AOF
+        aofWriter = new AOFWriter("commands.aof");
+
+        // Load previous state
+        loadFromAOF("commands.aof");
+
+        // Shutdown hook to close AOF safely
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (aofWriter != null) aofWriter.close();
+            System.out.println("AOF closed on shutdown");
+        }));
+
+        // Start server
         try (ServerSocket serverSocket = new ServerSocket(7777)) {
             System.out.println("Redis Server started on port 7777");
             while (true) {
